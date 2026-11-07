@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Synthesizer</title>
+<style>
+  :root {
+    --bg: #1e1e22;
+    --panel: #2a2a31;
+    --text: #e8e8ea;
+    --muted: #9a9aa4;
+    --accent: #e0a040;
+    --white-key: #f4f1ea;
+    --white-key-text: #33333a;
+    --black-key: #17171a;
+    --black-key-text: #d8d8dc;
+  }
+
+  body {
+    margin: 0;
+    padding: 24px 16px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 24px;
+  }
+
+  h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  #status { color: var(--muted); font-size: 13px; }
+  #status.connected { color: var(--accent); }
+
+  #mixing {
+    display: flex;
+    gap: 28px;
+    padding: 16px 28px;
+    background: var(--panel);
+    border-radius: 8px;
+  }
+  .channel {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    font-variant-numeric: tabular-nums;
+  }
+  .channel input {
+    writing-mode: vertical-lr;
+    direction: rtl;
+    height: 160px;
+    accent-color: var(--accent);
+  }
+  .channel .name { font-weight: 600; }
+  .channel .value { color: var(--muted); font-size: 12px; }
+
+  #keyboard {
+    position: relative;
+    display: flex;
+    width: min(100%, 960px);
+    height: 220px;
+    user-select: none;
+    touch-action: none;
+  }
+  .key {
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 2px;
+    padding-bottom: 10px;
+    border-radius: 0 0 6px 6px;
+    cursor: pointer;
+  }
+  .key.white {
+    flex: 1;
+    background: var(--white-key);
+    color: var(--white-key-text);
+    border: 1px solid #8a8a90;
+  }
+  .key.black {
+    position: absolute;
+    top: 0;
+    height: 62%;
+    transform: translateX(-50%);
+    z-index: 1;
+    background: var(--black-key);
+    color: var(--black-key-text);
+  }
+  .key.pressed { background: var(--accent); color: var(--black-key); }
+  .key .label { font-weight: 700; font-size: 15px; }
+  .key .note { font-size: 10px; opacity: 0.7; }
+
+  .hint { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Synthesizer</h1>
+<div id="status">connecting…</div>
+<div id="mixing"></div>
+<div id="keyboard"></div>
+<div class="hint">Play with the bottom two letter rows (lower octave) and the Q and number rows (upper octave), or with the mouse.</div>
+
+<script>
+  // Physical key positions (KeyboardEvent.code) of the keys, from the lowest key,
+  // which is expected to be a C. Keys past the end of this list are mouse only.
+  const KEY_CODES = [
+    "KeyZ", "KeyS", "KeyX", "KeyD", "KeyC", "KeyV", "KeyG", "KeyB", "KeyH", "KeyN", "KeyJ", "KeyM",
+    "KeyQ", "Digit2", "KeyW", "Digit3", "KeyE", "KeyR", "Digit5", "KeyT", "Digit6", "KeyY", "Digit7", "KeyU",
+  ];
+  const CODE_TO_KEY = new Map(KEY_CODES.map((code, i) => [code, i]));
+
+  const statusElement = document.getElementById("status");
+  const keyboardElement = document.getElementById("keyboard");
+  const mixingElement = document.getElementById("mixing");
+
+  let socket = null;
+  let keyElements = [];
+  const pressed = new Set();
+  let mixing = [];
+  let mixingScheduled = false;
+
+  function send(message) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(message));
+    }
+  }
+
+  function press(key) {
+    if (key >= keyElements.length || pressed.has(key)) return;
+    pressed.add(key);
+    keyElements[key].classList.add("pressed");
+    send({ type: "key", key, down: true });
+  }
+
+  function release(key) {
+    if (!pressed.delete(key)) return;
+    keyElements[key].classList.remove("pressed");
+    send({ type: "key", key, down: false });
+  }
+
+  function clearPressed() {
+    for (const key of pressed) keyElements[key].classList.remove("pressed");
+    pressed.clear();
+  }
+
+  function releaseAll() {
+    clearPressed();
+    send({ type: "release_all" });
+  }
+
+  // Labels printed on the user's keyboard at the physical positions, where the browser can tell
+  async function keyLabels() {
+    const fallback = code => code.replace(/^(Key|Digit)/, "");
+    try {
+      const layout = await navigator.keyboard.getLayoutMap();
+      return KEY_CODES.map(code => (layout.get(code) || fallback(code)).toUpperCase());
+    } catch {
+      return KEY_CODES.map(fallback);
+    }
+  }
+
+  function buildKeyboard(names, labels) {
+    const whiteCount = names.filter(name => !name.includes("#")).length;
+    let whitesBefore = 0;
+
+    keyboardElement.replaceChildren();
+    keyElements = names.map((name, i) => {
+      const element = document.createElement("div");
+      if (name.includes("#")) {
+        element.className = "key black";
+        element.style.left = `${(whitesBefore / whiteCount) * 100}%`;
+        element.style.width = `${60 / whiteCount}%`;
+      } else {
+        element.className = "key white";
+        whitesBefore++;
+      }
+
+      const label = document.createElement("span");
+      label.className = "label";
+      label.textContent = labels[i] ?? "";
+      const note = document.createElement("span");
+      note.className = "note";
+      note.textContent = name;
+      element.append(label, note);
+
+      element.addEventListener("pointerdown", event => { event.preventDefault(); press(i); });
+      element.addEventListener("pointerup", () => release(i));
+      element.addEventListener("pointerleave", () => release(i));
+
+      keyboardElement.append(element);
+      return element;
+    });
+  }
+
+  function buildMixing(names, values) {
+    mixing = [...values];
+    mixingElement.replaceChildren();
+    names.forEach((name, i) => {
+      const channel = document.createElement("label");
+      channel.className = "channel";
+
+      const slider = document.createElement("input");
+      slider.type = "range";
+      slider.min = 0;
+      slider.max = 1;
+      slider.step = "any";
+      slider.value = values[i];
+
+      const value = document.createElement("span");
+      value.className = "value";
+      value.textContent = values[i].toFixed(2);
+
+      const nameElement = document.createElement("span");
+      nameElement.className = "name";
+      nameElement.textContent = name;
+
+      slider.addEventListener("input", () => {
+        mixing[i] = Number(slider.value);
+        value.textContent = mixing[i].toFixed(2);
+        scheduleMixing();
+      });
+
+      channel.append(slider, value, nameElement);
+      mixingElement.append(channel);
+    });
+  }
+
+  // Sends at most one mixing update per frame
+  function scheduleMixing() {
+    if (mixingScheduled) return;
+    mixingScheduled = true;
+    requestAnimationFrame(() => {
+      mixingScheduled = false;
+      send({ type: "mixing", values: mixing });
+    });
+  }
+
+  function connect() {
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    socket = new WebSocket(`${protocol}//${location.host}/ws`);
+
+    socket.addEventListener("message", async event => {
+      const data = JSON.parse(event.data);
+      if (data.type === "config") {
+        buildKeyboard(data.keys, await keyLabels());
+        buildMixing(data.busbars, data.mixing);
+        statusElement.textContent = "connected";
+        statusElement.className = "connected";
+      }
+    });
+
+    socket.addEventListener("close", () => {
+      // The server releases all keys when the connection closes
+      clearPressed();
+      statusElement.textContent = "disconnected, reconnecting…";
+      statusElement.className = "";
+      setTimeout(connect, 1000);
+    });
+  }
+
+  window.addEventListener("keydown", event => {
+    if (event.ctrlKey || event.altKey || event.metaKey) return;
+    const key = CODE_TO_KEY.get(event.code);
+    if (key === undefined) return;
+    event.preventDefault();
+    if (!event.repeat) press(key);
+  });
+
+  window.addEventListener("keyup", event => {
+    const key = CODE_TO_KEY.get(event.code);
+    if (key !== undefined) release(key);
+  });
+
+  // Key up events get lost when the window loses focus
+  window.addEventListener("blur", releaseAll);
+
+  connect();
+</script>
+</body>
+</html>
