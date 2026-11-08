@@ -94,12 +94,15 @@ class Synthesizer:
 
         Yields blocks of shape (len(self.frequencies), self.batch_size)."""
 
-        # Unity gain Sallen-Key low pass per tone, with R1 = R2 = R and C1 = C2 = C,
-        # which gives Q = 0.5 and f0 = 1 / (2 pi R C)
-        cutoff_ratio = 1.0  # f0 relative to the tone frequency
-        capacitance = 22e-9
+        # Unity gain Sallen-Key low pass per tone, with R1 = R2 = R,
+        # which gives Q = sqrt(C1 / C2) / 2 (~1.58 here) and f0 = 1 / (2 pi R sqrt(C1 C2)).
+        # The resonance boosts the fundamental against the harmonics,
+        # f0 slightly below the tone keeps the fundamental gain near unity.
+        cutoff_ratio = 0.65  # f0 relative to the tone frequency
+        c1 = 100e-9  # Feedback capacitor
+        c2 = 10e-9  # Capacitor to ground
         resistances = _round_to_e_series(
-            1 / (2 * numpy.pi * cutoff_ratio * self._frequencies * capacitance),
+            1 / (2 * numpy.pi * cutoff_ratio * self._frequencies * numpy.sqrt(c1 * c2)),
             _e_series(96),
         )
 
@@ -107,7 +110,7 @@ class Synthesizer:
         coefficients = [
             scipy.signal.bilinear(
                 [1.0],
-                [(r * capacitance) ** 2, 2 * r * capacitance, 1.0],
+                [r * r * c1 * c2, 2 * r * c2, 1.0],
                 self._sample_rate,
             )
             for r in resistances
